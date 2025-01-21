@@ -222,21 +222,60 @@ class DenoiseStackStrategy(StackStrategy):
         return np.clip(result / total_count, 0, 255).astype(np.uint8)
 
 class HDRStackStrategy(StackStrategy):
-    def stack(self, images, batch_size=2):
+    def stack(self, image_paths, batch_size=2):
         """HDR堆叠"""
+        if not image_paths:
+            return None
+            
+        # 读取所有图片
+        images = []
+        total_count = len(image_paths)
+        
+        # 获取目标尺寸
+        target_size = self._get_target_size(image_paths)
+        if target_size is None:
+            return None
+            
+        # 读取并对齐所有图片
+        for i, path in enumerate(image_paths):
+            img = cv2.imread(path)
+            if img is not None:
+                images.append(img)
+            yield (i + 1) / total_count * 30
+        
         if not images:
             return None
+            
+        # 对齐图片（这里不转换为float32）
+        h, w = target_size
+        aligned = []
+        for img in images:
+            if img.shape[:2] != (h, w):
+                img = cv2.resize(img, (w, h))
+            aligned.append(img)  # 保持uint8类型
+        yield 40
         
-        aligned = self._align_images(images, self._get_target_size(images))
         # 计算每张图像的平均亮度    
         brightness_values = [self.calculate_average_brightness(img) for img in aligned]
-        # 根据亮度排序
-        sorted_images = [img for _, img in sorted(zip(brightness_values, images))]
-        # 创建HDR图像
-        hdr_image = self.create_hdr(sorted_images)
-        # 将HDR图像映射到普通显示设备
-        return self._tonemap(hdr_image)
+        yield 50
         
+        # 根据亮度排序并估算相对曝光时间
+        brightness_and_images = sorted(zip(brightness_values, aligned))
+        sorted_images = [img for _, img in brightness_and_images]
+        
+        # 估算相对曝光时间（基于亮度的倒数）
+        min_brightness = min(brightness_values)
+        exposure_times = np.array([min_brightness/b for b in brightness_values], dtype=np.float32)
+        yield 60
+        
+        # 创建HDR图像
+        hdr_image = self.create_hdr(sorted_images, exposure_times)
+        yield 80
+        
+        # 将HDR图像映射到普通显示设备
+        result = self._tonemap(hdr_image)
+        yield result
+    
     def calculate_average_brightness(self, image):
         """
         计算图像的平均亮度。
@@ -249,21 +288,18 @@ class HDRStackStrategy(StackStrategy):
         # 计算并返回灰度图像的平均值
         return np.mean(gray_image)
     
-    def create_hdr(self, images):
+    def create_hdr(self, images, times):
         """
-        使用加权平均的方法来合成 HDR 图像。
-        :param images: 一个包含多张曝光不同的图像的列表
-        :return: 合成后的 HDR 图像
+        使用OpenCV的Debevec方法来合成HDR图像
+        :param images: 图像列表（uint8类型）
+        :param times: 曝光时间列表
+        :return: HDR图像
         """
-        # 将图像转换为浮动数据类型，以便进行加权操作
-        images_floats = [np.float32(img) for img in images]
-
-        # 使用OpenCV的createMergeDebevec()来生成HDR图像
+        # 创建HDR合成器
         merge_debevec = cv2.createMergeDebevec()
-
-        # 合成HDR图像
-        hdr = merge_debevec.process(images_floats)
-
-        # 返回合成后的HDR图像
+        
+        # 合成HDR图像（直接使用uint8类型的图像）
+        hdr = merge_debevec.process(images, times=times)
+        
         return hdr
 
